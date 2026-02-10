@@ -126,13 +126,12 @@ def format_duration(seconds):
 
 # ─── Dependencies Check ─────────────────────────────────────────────────────
 try:
-    from pypdf import PdfReader, PdfWriter
     import pytesseract
     from PIL import Image
-    import fitz  # PyMuPDF – renders pages as images (preserves orientation)
+    import fitz  # PyMuPDF – renders pages, assembles optimised PDFs
 except ImportError:
     print(f"\n  {Style.RED}{Style.CROSS}  Fehlende Abhängigkeiten! Bitte installieren:{Style.RESET}")
-    print(f"  {Style.YELLOW}     pip install pypdf pytesseract Pillow PyMuPDF{Style.RESET}\n")
+    print(f"  {Style.YELLOW}     pip install pytesseract Pillow PyMuPDF{Style.RESET}\n")
     sys.exit(1)
 
 # ─── Tesseract Configuration ────────────────────────────────────────────────
@@ -162,12 +161,13 @@ else:
 def is_pdf_searchable(pdf_path):
     """Checks if a PDF has significant text content."""
     try:
-        reader = PdfReader(pdf_path)
+        doc = fitz.open(pdf_path)
         text_content = ""
-        for page in reader.pages:
-            text = page.extract_text()
+        for page in doc:
+            text = page.get_text()
             if text:
                 text_content += text
+        doc.close()
         return len(text_content.strip()) > 50
     except Exception:
         return False
@@ -175,60 +175,129 @@ def is_pdf_searchable(pdf_path):
 def ocr_pdf(input_path, output_path, pages_done_before=0, total_pages_all=0):
     """Performs OCR on a PDF file with progress reporting.
     
-    Uses PyMuPDF to render each page as an image (preserving all
-    transformations like rotation/mirroring) before passing to Tesseract.
-    The resulting OCR pages are scaled back to the original page dimensions.
+    Optimised pipeline for minimal file size:
+      1. Render each page at 200 DPI (sufficient for OCR accuracy)
+      2. Compress the rendered image as JPEG (quality 75)
+      3. Build a new PDF page with the compressed image as background
+      4. Overlay invisible OCR text from Tesseract on top
+      5. Save with deflate compression and garbage collection
     
     Args:
         pages_done_before: Number of pages already processed in previous files.
         total_pages_all:   Total pages across all files to process (for global progress).
     """
-    try:
-        doc = fitz.open(input_path)
-        writer = PdfWriter()
+    OCR_DPI = 200
+    JPEG_QUALITY = 75
 
-        total_pages = len(doc)
+    try:
+        src_doc = fitz.open(input_path)
+        out_doc = fitz.open()  # new empty PDF
+
+        total_pages = len(src_doc)
         # Fall back to per-file progress if no global total provided
         if total_pages_all <= 0:
             total_pages_all = total_pages
             pages_done_before = 0
 
-        for i, page in enumerate(doc):
+        for i, page in enumerate(src_doc):
             global_done = pages_done_before + i + 1
             progress_bar(
                 global_done, total_pages_all,
                 label=f"Seite {i+1}/{total_pages} · Gesamt {global_done}/{total_pages_all}"
             )
 
-            # Remember original page dimensions (in points, 72 DPI)
+            # ── Original page dimensions (in points, 72 pt/inch) ────────
             orig_width = page.rect.width
             orig_height = page.rect.height
 
-            # Render page at 300 DPI – exactly as it visually appears
-            mat = fitz.Matrix(300 / 72, 300 / 72)
+            # ── 1. Render page at OCR_DPI ────────────────────────────────
+            mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
             pix = page.get_pixmap(matrix=mat)
             pil_image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
+            # ── 2. Run Tesseract OCR to get searchable PDF layer ─────────
             try:
-                pdf_bytes = pytesseract.image_to_pdf_or_hocr(pil_image, extension='pdf', lang='eng+deu')
+                ocr_pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                    pil_image, extension='pdf', lang='eng+deu'
+                )
             except pytesseract.TesseractError:
-                pdf_bytes = pytesseract.image_to_pdf_or_hocr(pil_image, extension='pdf', lang='eng')
+                ocr_pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                    pil_image, extension='pdf', lang='eng'
+                )
 
-            ocr_page = PdfReader(io.BytesIO(pdf_bytes)).pages[0]
+            # ── 3. Compress the image as JPEG ────────────────────────────
+            jpeg_buf = io.BytesIO()
+            pil_image.save(jpeg_buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            jpeg_buf.seek(0)
 
-            # Scale OCR page back to original dimensions
-            ocr_mb = ocr_page.mediabox
-            ocr_width = float(ocr_mb.width)
-            if ocr_width > 0:
-                scale = orig_width / ocr_width
-                ocr_page.scale_by(scale)
+            # ── 4. Build output page ─────────────────────────────────────
+            # Create a new page with original dimensions
+            out_page = out_doc.new_page(width=orig_width, height=orig_height)
 
-            writer.add_page(ocr_page)
+            # Insert the compressed JPEG as the background image
+            img_rect = fitz.Rect(0, 0, orig_width, orig_height)
+            out_page.insert_image(img_rect, stream=jpeg_buf.getvalue())
 
-        doc.close()
+            # ── 5. Overlay the invisible OCR text layer ──────────────────
+            # Open the Tesseract OCR PDF as a temporary document
+            ocr_doc = fitz.open("pdf", ocr_pdf_bytes)
+            ocr_page = ocr_doc[0]
 
-        with open(output_path, "wb") as f:
-            writer.write(f)
+            # Calculate scale factor from OCR page to original dimensions
+            sx = orig_width / ocr_page.rect.width if ocr_page.rect.width > 0 else 1
+            sy = orig_height / ocr_page.rect.height if ocr_page.rect.height > 0 else 1
+
+            # Extract text blocks from OCR and insert as invisible text
+            text_dict = ocr_page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+            for block in text_dict.get("blocks", []):
+                if block.get("type") != 0:  # skip non-text blocks
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if not text:
+                            continue
+                        # Scale OCR coordinates to output page coordinates
+                        bbox = span.get("bbox", (0, 0, 0, 0))
+                        x0 = bbox[0] * sx
+                        y0 = bbox[1] * sy
+                        x1 = bbox[2] * sx
+                        y1 = bbox[3] * sy
+                        font_size = span.get("size", 10) * sy
+
+                        # Clamp font size to reasonable range
+                        font_size = max(1, min(font_size, 200))
+
+                        # Calculate text width to adjust font size for accurate placement
+                        text_width = x1 - x0
+                        text_height = y1 - y0
+
+                        if text_width > 0 and text_height > 0:
+                            # Insert invisible (render mode 3) text at the correct position
+                            tw = fitz.TextWriter(out_page.rect)
+                            try:
+                                tw.append(
+                                    fitz.Point(x0, y1),  # baseline position
+                                    text,
+                                    fontsize=font_size,
+                                    font=fitz.Font("helv"),
+                                )
+                                tw.write_text(out_page, render_mode=3, opacity=0)
+                            except Exception:
+                                pass  # skip problematic text spans silently
+
+            ocr_doc.close()
+
+        src_doc.close()
+
+        # ── 6. Save with maximum compression ─────────────────────────────
+        out_doc.save(
+            output_path,
+            deflate=True,
+            garbage=4,        # remove duplicates & unused objects
+            clean=True,       # clean & optimise content streams
+        )
+        out_doc.close()
 
         return True
 
